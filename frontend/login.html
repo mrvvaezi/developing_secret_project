@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#181822">
+  <title>ورود به اتاق موسیقی</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/login.css">
+</head>
+<body>
+  <main>
+    <a class="brand" href="/login" dir="ltr">musicroom<span>.</span></a>
+    <h1>بیا توی اتاق</h1>
+    <p>نام کاربری و رمز عبوری که مدیر بهت داده وارد کن. ثبت‌نام عمومی بسته است.</p>
+    <form id="login-form">
+      <label for="login-name">نام کاربری</label>
+      <input id="login-name" name="username" autocomplete="username" maxlength="40" required placeholder="نام کاربری" dir="auto" autofocus>
+      <label for="login-pin">رمز عبور</label>
+      <input id="login-pin" name="password" type="password" autocomplete="current-password" maxlength="128" required placeholder="رمز عبور" dir="ltr">
+      <button id="login-submit" type="submit">ورود</button>
+      <p id="login-status" role="status" aria-live="polite"></p>
+    </form>
+  </main>
+  <script src="/static/login.js?v=57b0d13cab24"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+
+services:
+  music-room:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${MUSIC_PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    restart: unless-stopped
+    ports:
+      - "${MUSIC_PORT:-8000}:8000"
+    environment:
+      MUSIC_ADMIN_PASSWORD: ${MUSIC_ADMIN_PASSWORD:?Set MUSIC_ADMIN_PASSWORD in .env}
+      MUSIC_ADMIN_TOKEN: ${MUSIC_ADMIN_TOKEN:?Set MUSIC_ADMIN_TOKEN in .env}
+      MUSIC_ADMIN_USERNAME: ${MUSIC_ADMIN_USERNAME:-admin}
+      MUSIC_SESSION_SECRET: ${MUSIC_SESSION_SECRET:?Set MUSIC_SESSION_SECRET in .env}
+      MUSIC_DB_HOST: users-db
+      MUSIC_DB_NAME: music_room
+      MUSIC_DB_USER: music_room
+      MUSIC_DB_PASSWORD: ${MUSIC_DB_PASSWORD:?Set MUSIC_DB_PASSWORD in .env}
+    depends_on:
+      users-db:
+        condition: service_healthy
+    volumes:
+      - ./data:/srv/data
+
+  users-db:
+    image: postgres:17
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      POSTGRES_DB: music_room
+      POSTGRES_USER: music_room
+      POSTGRES_PASSWORD: ${MUSIC_DB_PASSWORD:?Set MUSIC_DB_PASSWORD in .env}
+    volumes:
+      - users-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U music_room -d music_room"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  users-db-data:
