@@ -16,8 +16,9 @@ ADMIN_USERNAME = os.environ.get('MUSIC_ADMIN_USERNAME', 'admin')
 SESSION_SECRET = os.environ.get('MUSIC_SESSION_SECRET', '')
 SESSION_COOKIE = 'music_session'
 SESSION_SECONDS = 30 * 24 * 3600
-PUBLIC_PATHS = {'/login', '/api/auth/login', '/static/login.css', '/static/login.js',
-                '/static/favicon.svg', '/static/fonts/Vazirmatn.woff2'}
+PUBLIC_PATHS = {'/login', '/api/auth/login', '/manifest.webmanifest', '/sw.js', '/offline.html',
+                '/static/favicon.svg', '/static/fonts/Vazirmatn.woff2',
+                '/static/icon-192.png', '/static/icon-512.png'}
 
 
 def connection():
@@ -69,11 +70,7 @@ def init_auth():
             token_hash TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             pin_version TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL)''')
         con.execute('CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at)')
-        con.execute('''CREATE TABLE IF NOT EXISTS login_attempts (
-            client_key TEXT PRIMARY KEY, attempts INTEGER NOT NULL,
-            window_started TIMESTAMPTZ NOT NULL DEFAULT now())''')
         con.execute('DELETE FROM sessions WHERE expires_at <= now() OR pin_version <> %s', (fingerprint(),))
-        con.execute("DELETE FROM login_attempts WHERE window_started < now() - interval '10 minutes'")
 
 
 def hash_password(password):
@@ -104,19 +101,35 @@ def create_user(name, password):
     return user
 
 
-def login(name, password, client, previous_token=''):
+def update_user(user_id, name, password=None):
+    if type(user_id) is not int or user_id <= 0:
+        raise HTTPException(400, 'کاربر نامعتبر است.')
+    name = display_name(name)
+    if password is not None and (not isinstance(password, str) or not 8 <= len(password) <= 128):
+        raise HTTPException(400, 'رمز عبور باید بین ۸ تا ۱۲۸ کاراکتر باشد.')
+    with connection() as con:
+        existing = con.execute('SELECT id FROM users WHERE name_key=%s AND id<>%s',
+                               (name.casefold(), user_id)).fetchone()
+        if existing:
+            raise HTTPException(409, 'این نام کاربری قبلاً ثبت شده است.')
+        if password is None:
+            user = con.execute('''UPDATE users SET name=%s,name_key=%s WHERE id=%s
+                RETURNING id,name,is_admin,password_hash IS NOT NULL AS active''',
+                               (name, name.casefold(), user_id)).fetchone()
+        else:
+            user = con.execute('''UPDATE users SET name=%s,name_key=%s,password_hash=%s WHERE id=%s
+                RETURNING id,name,is_admin,password_hash IS NOT NULL AS active''',
+                               (name, name.casefold(), hash_password(password), user_id)).fetchone()
+            con.execute('DELETE FROM sessions WHERE user_id=%s', (user_id,))
+        if not user:
+            raise HTTPException(404, 'کاربر پیدا نشد.')
+    return user
+
+
+def login(name, password, previous_token=''):
     name = display_name(name)
     if not isinstance(password, str) or len(password) > 128:
         raise HTTPException(400, 'رمز عبور را وارد کنید.')
-    client_key = hmac.new(SESSION_SECRET.encode(), client.encode(), hashlib.sha256).hexdigest()
-    # Commit the attempt even when authentication fails.
-    with connection() as con:
-        con.execute("DELETE FROM login_attempts WHERE window_started < now() - interval '10 minutes'")
-        row = con.execute('''INSERT INTO login_attempts(client_key,attempts) VALUES (%s,1)
-            ON CONFLICT(client_key) DO UPDATE SET attempts=login_attempts.attempts+1
-            RETURNING attempts''', (client_key,)).fetchone()
-    if row['attempts'] > 10:
-        raise HTTPException(429, 'تلاش‌های زیادی انجام شده؛ ده دقیقه دیگر امتحان کنید.', headers={'Retry-After': '600'})
     token = secrets.token_urlsafe(32)
     with connection() as con:
         user = con.execute('SELECT id,name,is_admin,password_hash FROM users WHERE name_key=%s',
@@ -125,7 +138,6 @@ def login(name, password, client, previous_token=''):
             raise HTTPException(401, 'نام کاربری یا رمز عبور درست نیست.')
         user.pop('password_hash')
         con.execute('UPDATE users SET last_login_at=now() WHERE id=%s', (user['id'],))
-        con.execute('DELETE FROM login_attempts WHERE client_key=%s', (client_key,))
         con.execute('DELETE FROM sessions WHERE expires_at <= now() OR token_hash=%s', (token_hash(previous_token),))
         con.execute('''INSERT INTO sessions(token_hash,user_id,pin_version,expires_at)
             VALUES (%s,%s,%s,now() + %s * interval '1 second')''',
@@ -170,7 +182,7 @@ class AuthMiddleware:
                 if websocket:
                     return await send({'type': 'websocket.close', 'code': 4403})
                 return await JSONResponse({'detail': 'درخواست نامعتبر است.'}, status_code=403)(scope, receive, send)
-        if not websocket and scope['path'] in PUBLIC_PATHS:
+        if not websocket and (scope['path'] in PUBLIC_PATHS or scope['path'].startswith('/_next/static/')):
             return await self.app(scope, receive, send)
         try:
             user = await run_in_threadpool(session_user, request.cookies.get(SESSION_COOKIE, ''))

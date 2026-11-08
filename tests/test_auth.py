@@ -8,7 +8,7 @@ from unittest.mock import patch, AsyncMock
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from backend.app import auth, main
+from backend.app import auth, main, storage
 from pg_support import isolate_database
 
 
@@ -29,7 +29,7 @@ class AuthTests(unittest.TestCase):
         self.addCleanup(state.stop)
         auth.init_auth()
         with auth.connection() as con:
-            con.execute('TRUNCATE users, sessions, login_attempts RESTART IDENTITY CASCADE')
+            con.execute('TRUNCATE users, sessions RESTART IDENTITY CASCADE')
         auth.create_user('سارا', 'test-password')
         self.client = TestClient(main.app)
         self.client.__enter__()
@@ -51,7 +51,7 @@ class AuthTests(unittest.TestCase):
             with self.client.websocket_connect('/ws'):
                 self.fail('Anonymous websocket accepted')
         self.assertEqual(self.client.get('/login').status_code, 200)
-        self.assertEqual(self.client.get('/static/login.css').status_code, 200)
+        self.assertEqual(self.client.get('/static/fonts/Vazirmatn.woff2').status_code, 200)
 
     def test_repeat_login_uses_existing_postgres_user(self):
         auth.create_user('Sara', 'test-password')
@@ -71,12 +71,12 @@ class AuthTests(unittest.TestCase):
         self.assertIn('no-store', self.client.get('/').headers['cache-control'])
         self.assertEqual(self.client.post('/api/admin/control', json={'action': 'next'}).status_code, 403)
 
-    def test_invalid_credentials_and_bruteforce_limit(self):
+    def test_invalid_credentials_do_not_block_later_login(self):
         for name in ('', 'Guest', 'gUsT', 'مهمان', 'میهمان', '\u200b', 'Ｇｕｅｓｔ', 'a' * 41):
             self.assertEqual(self.login(name).status_code, 400)
-        for _ in range(10):
+        for _ in range(12):
             self.assertEqual(self.login(pin='000000').status_code, 401)
-        self.assertEqual(self.login().status_code, 429)
+        self.assertEqual(self.login().status_code, 200)
         with auth.connection() as con:
             self.assertEqual(con.execute('SELECT count(*) AS n FROM users').fetchone()['n'], 1)
 
@@ -98,6 +98,21 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200)
         self.assertNotIn('password_hash', result.text)
         self.assertEqual(self.client.post('/api/admin/users', headers=headers, json={'name': 'Ali', 'password': 'new-password'}).status_code, 409)
+        user_id = result.json()['user']['id']
+        self.assertEqual(self.client.patch(f'/api/admin/users/{user_id}',
+                                          json={'name': 'علی جدید', 'password': 'changed-password'}).status_code, 403)
+        changed = self.client.patch(f'/api/admin/users/{user_id}', headers=headers,
+                                    json={'name': 'علی جدید', 'password': 'changed-password'})
+        self.assertEqual(changed.status_code, 200)
+        self.assertEqual(changed.json()['user']['name'], 'علی جدید')
+        self.assertEqual(self.login('Ali', 'ali-password').status_code, 401)
+        self.assertEqual(self.login('علی جدید', 'changed-password').status_code, 200)
+        unchanged_password = self.client.patch(f'/api/admin/users/{user_id}', headers=headers,
+                                               json={'name': 'علی نهایی', 'password': ''})
+        self.assertEqual(unchanged_password.status_code, 200)
+        self.assertEqual(self.login('علی نهایی', 'changed-password').status_code, 200)
+        self.assertEqual(self.login().status_code, 200)
+
         tone = (Path(__file__).parent / 'fixtures' / 'tone.mp3').read_bytes()
         self.client.post('/api/upload', files={'file': ('song.mp3', tone, 'audio/mpeg')})
         play_id = self.client.get('/api/state').json()['play_id']
@@ -108,7 +123,36 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(report[0]['title'], 'song.mp3')
         public = self.client.get('/api/reactions/' + str(play_id)).json()
         self.assertEqual(set(public), {'play_id', 'reactions', 'mine'})
-        self.assertEqual(self.login('Ali', 'ali-password').status_code, 200)
+        self.assertEqual(self.login('علی نهایی', 'changed-password').status_code, 200)
+
+    def test_admin_can_change_hero_title_for_everyone_and_it_survives_restart(self):
+        title = 'موسیقیِ امشب\nبا انتخاب شما'
+        self.assertEqual(self.client.put('/api/admin/site-copy', json={'hero_title': title}).status_code, 401)
+        self.login()
+        headers = {'X-Admin-Token': 'admin-test'}
+        self.assertEqual(self.client.put('/api/admin/site-copy', headers=headers,
+                                         json={'hero_title': title}).status_code, 403)
+        auth.create_user('مدیر تست', 'admin-password')
+        with auth.connection() as con:
+            con.execute("UPDATE users SET is_admin=TRUE WHERE name=%s", ('مدیر تست',))
+        self.login('مدیر تست', 'admin-password')
+        for invalid in ({}, {'unknown': 'text'}, {'hero_title': ''},
+                        {'hero_title': 'x' * 101}, {'hero_title': 'one\ntwo\nthree\nfour'},
+                        {'hero_title': 123}):
+            self.assertEqual(self.client.put('/api/admin/site-copy', headers=headers,
+                                             json=invalid).status_code, 400)
+        with self.client.websocket_connect('/ws') as socket:
+            self.assertEqual(socket.receive_json()['site_copy']['hero_title'],
+                             storage.DEFAULT_SITE_COPY['hero_title'])
+            socket.receive_json()  # chat history
+            response = self.client.put('/api/admin/site-copy', headers=headers,
+                                       json={'hero_title': title})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()['site_copy']['hero_title'], title)
+            self.assertEqual(socket.receive_json()['site_copy']['hero_title'], title)
+        self.assertEqual(self.client.get('/api/state').json()['site_copy']['hero_title'], title)
+        storage.init_storage(main.DB)
+        self.assertEqual(self.client.get('/api/state').json()['site_copy']['hero_title'], title)
 
     def test_admin_chat_deletion_permissions_persistence_and_broadcast(self):
         self.login()

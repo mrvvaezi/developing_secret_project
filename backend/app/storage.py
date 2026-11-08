@@ -2,9 +2,12 @@
 import sqlite3
 from contextlib import closing
 from psycopg import sql
+from psycopg.types.json import Jsonb
 from . import auth
 
 TABLES = ('tracks', 'queue', 'state', 'play_history', 'reactions', 'chat_messages')
+
+DEFAULT_SITE_COPY = {'hero_title': 'یک اتاق.\nهزار حالِ خوب.'}
 
 
 def init_storage(legacy_path):
@@ -14,6 +17,23 @@ def init_storage(legacy_path):
             id TEXT PRIMARY KEY, title TEXT NOT NULL, uploader TEXT NOT NULL,
             duration DOUBLE PRECISION NOT NULL, filename TEXT NOT NULL,
             created DOUBLE PRECISION NOT NULL, content_hash TEXT)''')
+        con.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS artist TEXT NOT NULL DEFAULT ''")
+        con.execute("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS metadata_version INTEGER NOT NULL DEFAULT 0")
+        con.execute('CREATE INDEX IF NOT EXISTS tracks_artist ON tracks(artist)')
+        con.execute('CREATE INDEX IF NOT EXISTS tracks_uploader ON tracks(uploader)')
+        con.execute('CREATE SEQUENCE IF NOT EXISTS catalog_revision')
+        con.execute("CREATE OR REPLACE FUNCTION bump_catalog_revision() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('catalog_revision'); RETURN NULL; END $$")
+        con.execute('DROP TRIGGER IF EXISTS catalog_changed ON tracks')
+        con.execute('CREATE TRIGGER catalog_changed AFTER INSERT OR UPDATE OR DELETE ON tracks FOR EACH STATEMENT EXECUTE FUNCTION bump_catalog_revision()')
+        con.execute("""CREATE TABLE IF NOT EXISTS playlists (
+            id BIGSERIAL PRIMARY KEY, owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 100),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        con.execute("""CREATE TABLE IF NOT EXISTS playlist_tracks (
+            position BIGSERIAL PRIMARY KEY,
+            playlist_id BIGINT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+            track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+            UNIQUE(playlist_id, track_id))""")
         con.execute('''CREATE TABLE IF NOT EXISTS queue (
             position BIGSERIAL PRIMARY KEY, track_id TEXT NOT NULL REFERENCES tracks(id))''')
         con.execute('''CREATE TABLE IF NOT EXISTS state (
@@ -32,6 +52,10 @@ def init_storage(legacy_path):
         con.execute('''CREATE TABLE IF NOT EXISTS chat_messages (
             id BIGSERIAL PRIMARY KEY, listener_id TEXT NOT NULL, name TEXT NOT NULL,
             text TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL)''')
+        con.execute('''CREATE TABLE IF NOT EXISTS site_copy (
+            id INTEGER PRIMARY KEY CHECK(id=1), copy JSONB NOT NULL)''')
+        con.execute('INSERT INTO site_copy(id,copy) VALUES (1,%s) ON CONFLICT(id) DO NOTHING',
+                    (Jsonb(DEFAULT_SITE_COPY),))
         con.execute('CREATE INDEX IF NOT EXISTS tracks_content_hash ON tracks(content_hash)')
         con.execute('CREATE INDEX IF NOT EXISTS history_open ON play_history(track_id) WHERE ended_at IS NULL')
         con.execute('CREATE TABLE IF NOT EXISTS storage_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())')

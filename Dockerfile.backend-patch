@@ -1,0 +1,6 @@
+# Backend-only patch using a locally tagged, previously built application image.
+# The base must already contain the matching Python dependencies and frontend.
+ARG RUNTIME_IMAGE=music-room:runtime-base
+FROM ${RUNTIME_IMAGE}
+WORKDIR /srv
+COPY backend ./backend

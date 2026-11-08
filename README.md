@@ -56,7 +56,7 @@ docker compose exec -T users-db pg_dump -U music_room music_room > music-room-us
 
 ## رابط کاربری
 
-رابط فارسی و راست‌به‌چپ با منوی کناری، آرشیو کارت‌محور و کنترل پخش، تایم‌لاین و واکنش‌ها داخل کارت اصلی ارائه می‌شود. میز دی‌جی بلافاصله زیر کارت اصلی قرار دارد. تنها انیمیشن رابط، چرخش صفحهٔ گرامافون هنگام پخش است؛ هنگام مکث می‌ایستد و با تنظیم کاهش حرکت دستگاه غیرفعال می‌شود. در موبایل، ناوبری به بالای صفحه منتقل می‌شود. فونت وزیرمتن و تمام فایل‌های ظاهری روی خود سرور میزبانی می‌شوند و برای نمایش به اینترنت نیاز ندارند. مجوز فونت در `frontend/fonts/OFL.txt` موجود است.
+رابط Next.js فارسی و راست‌به‌چپ با منوی کناری، آرشیو کارت‌محور و پلیر ثابت پایین صفحه ارائه می‌شود. میز دی‌جی در تب مدیریت است. در موبایل ناوبری پایین صفحه قرار دارد و تنظیم کاهش حرکت دستگاه رعایت می‌شود. فونت وزیرمتن و تمام فایل‌های ظاهری روی خود سرور میزبانی می‌شوند و برای نمایش به اینترنت نیاز ندارند. مجوز فونت در `frontend/public/static/fonts/OFL.txt` موجود است.
 
 ## ذخیره‌سازی دائمی
 
@@ -77,6 +77,9 @@ docker compose exec -T users-db pg_dump -U music_room music_room > music-room-us
 ## اجرای محلی بدون Docker
 
 ```bash
+# Node.js 22 لازم است؛ خروجی فرانت توسط FastAPI ارائه می‌شود.
+npm --prefix frontend ci
+npm --prefix frontend run build
 pip install -r backend/requirements.txt
 export MUSIC_ADMIN_PASSWORD='your-password'
 export MUSIC_ADMIN_TOKEN='your-long-secret-token'
@@ -93,17 +96,44 @@ uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 
 ## آزمون‌ها
 
-`node tests/test_uploads.js` تست‌های آپلود مرورگر را اجرا می‌کند. تست‌های Python با `python -m unittest discover -s tests -v` اجرا می‌شوند؛ برای تست‌های ورود، `httpx==0.28.1` و یک PostgreSQL آزمایشی لازم است. تست‌های ورود فقط وقتی `MUSIC_DB_NAME` با `music_room_auth_test` شروع شود فعال می‌شوند و جدول‌های همان دیتابیس آزمایشی را پاک می‌کنند؛ از دیتابیس واقعی برای تست استفاده نکنید.
+`npm --prefix frontend test` تست‌های انتقال وضعیت اتاق و آپلود چندفایلی را اجرا می‌کند. `npm --prefix frontend run typecheck` بررسی TypeScript و `npm --prefix frontend run build` بیلد تولید را اجرا می‌کند. تست‌های Python با `python -m unittest discover -s tests -v` اجرا می‌شوند؛ برای تست‌های ورود، `httpx==0.28.1` و یک PostgreSQL آزمایشی لازم است. تست‌های ورود فقط وقتی `MUSIC_DB_NAME` با `music_room_auth_test` شروع شود فعال می‌شوند و جدول‌های همان دیتابیس آزمایشی را پاک می‌کنند؛ از دیتابیس واقعی برای تست استفاده نکنید.
 
 
 ## ساختار کد
 
 برای رفع timeout دانلود از `files.pythonhosted.org`، بیلد Docker Compose به‌صورت پیش‌فرض از mirror علی‌بابا (`https://mirrors.aliyun.com/pypi/simple/`) استفاده می‌کند. آدرس مخزن را می‌توانید با `MUSIC_PIP_INDEX_URL` در `.env` تغییر دهید؛ برای مخزن اصلی مقدار `https://pypi.org/simple` را بگذارید. پس از تغییر، `docker compose up -d --build` را اجرا کنید. نسخه‌های وابستگی‌های اصلی و بررسی گواهی HTTPS حفظ شده‌اند.
 
-- `frontend/`: رابط کاربری با HTML، CSS و JavaScript ساده، همراه فونت و تصاویر؛ بدون مرحلهٔ build.
+- `frontend/app/`: صفحات Next.js App Router با TypeScript و طراحی راست‌به‌چپ.
+- `frontend/components/`: پلیر سراسری، چت، آرشیو، آپلود، واکنش‌ها و مدیریت.
+
+مدیر پس از ورود به پنل مدیریت می‌تواند در تب «متن کارت»، تیتر بزرگ کارت سبز را تغییر دهد. متن در PostgreSQL ذخیره می‌شود و هم‌زمان برای کاربران متصل نمایش داده می‌شود؛ دکمهٔ «متن پیش‌فرض» بازگرداندن تیتر اولیه را آماده می‌کند و با «ذخیرهٔ تیتر» اعمال می‌شود.
+
+در تب «کاربران»، مدیر می‌تواند حساب جدید بسازد یا با دکمهٔ ویرایش کنار هر کاربر، نام کاربری و رمز او را تغییر دهد. خالی گذاشتن رمز جدید، رمز فعلی را حفظ می‌کند؛ تغییر رمز نشست‌های فعال همان کاربر را می‌بندد.
+- `frontend/lib/`: قرارداد API، اتصال WebSocket، همگام‌سازی صدا و منطق آپلود.
+- `frontend/public/`: فونت محلی، آیکن‌ها، manifest و صفحهٔ آفلاین.
+- `frontend/out/`: خروجی تولیدی `next build` (در Git ثبت نمی‌شود).
 - `backend/app/`: کد Python و FastAPI شامل API، WebSocket، احراز هویت و ذخیره‌سازی.
 - `backend/requirements.txt`: وابستگی‌های بک‌اند.
 - `tests/`: تست‌های بک‌اند و JavaScript.
 - `data/`: داده‌ها و فایل‌های موسیقی؛ مسیر آن تغییر نکرده است.
 
-دستورهای نصب و اجرا را از ریشهٔ پروژه اجرا کنید. فایل‌های فرانت و بک جدا هستند، اما FastAPI همچنان فرانت را روی مسیر `/static` و صفحات `/` و `/login` ارائه می‌کند. ارتباط API و WebSocket روی همان دامنه باقی می‌ماند. اجرای Docker Compose همچنان از ریشهٔ پروژه است.
+دستورهای نصب و اجرا را از ریشهٔ پروژه اجرا کنید. فرانت با Next.js و React ساخته و به‌صورت static export توسط FastAPI ارائه می‌شود؛ Node فقط برای ساخت لازم است. مسیرهای `/`، `/login` و `/admin/music` به خروجی Next متصل‌اند؛ فایل‌های عمومی در `/_next/static/` و `/static/` قرار دارند. داده‌های خصوصی و همهٔ APIها همچنان زیر کنترل نشست بک‌اند هستند. ارتباط API و WebSocket هم‌دامنه است و نیازی به CORS یا سرویس Node جداگانه نیست. Docker با یک مرحلهٔ Node فرانت را می‌سازد و فقط خروجی آن را وارد تصویر Python می‌کند.
+
+برای نصب به‌صورت PWA از HTTPS (یا localhost) و مرورگر سازگار استفاده کنید. Service Worker فقط صفحهٔ عمومی قطع اتصال را ذخیره می‌کند؛ پیام‌ها، نشست‌ها، API و فایل‌های موسیقی آفلاین ذخیره نمی‌شوند. پخش زنده به اتصال سرور نیاز دارد. تغییر تب‌های داخلی پلیر را نگه می‌دارد؛ با قطع WebSocket صدا تا اتصال مجدد مکث می‌شود.
+
+در توسعه، پس از تغییرات `npm --prefix frontend run build` را اجرا کنید و از پورت FastAPI استفاده کنید تا ورود و WebSocket هم‌دامنه بمانند. پیش‌نمایش مستقل `next dev` فقط فرانت است و API بک‌اند را ارائه نمی‌کند.
+
+نسخهٔ قبلی فرانت برای بازگشت محلی در `migration-backups/pre-next-frontend/` نگه داشته شده و وارد تصویر Docker نمی‌شود.
+
+### اصلاح بک‌اند بدون دسترسی به Docker Hub
+
+اگر فقط کد بک‌اند تغییر کرده و وابستگی‌های Python و فرانت‌اند همان نسخهٔ قبلی هستند، از ایمیج موجود استفاده کنید:
+
+```bash
+docker tag developing_secret_project-music-room:latest music-room:runtime-base
+docker build --pull=false -f Dockerfile.backend-patch -t developing_secret_project-music-room:latest .
+docker compose up -d --no-build --no-deps music-room
+docker compose logs --tail=50 music-room
+```
+
+ایمیج `music-room:runtime-base` نسخهٔ قبل از اصلاح را نگه می‌دارد. این روش فرانت‌اند را بیلد نمی‌کند و وابستگی جدید نصب نمی‌کند؛ برای تغییر آن‌ها از بیلد کامل استفاده کنید.

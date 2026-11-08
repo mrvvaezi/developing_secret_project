@@ -1,3 +1,7 @@
+from typing import Annotated
+import base64
+import binascii
+import re
 import asyncio
 
 import hashlib
@@ -16,13 +20,14 @@ from pathlib import Path
 
 
 
-from fastapi import FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 
 from fastapi.responses import FileResponse
 
 from fastapi.staticfiles import StaticFiles
 
 from mutagen.mp3 import MP3
+from psycopg.types.json import Jsonb
 
 from starlette.concurrency import run_in_threadpool
 
@@ -34,7 +39,7 @@ from . import auth, storage, presence
 
 BASE = Path(__file__).resolve().parents[2]
 
-FRONTEND = BASE / 'frontend'
+FRONTEND = BASE / 'frontend' / 'out'
 
 DATA = BASE / 'data'
 
@@ -66,6 +71,11 @@ def db():
 
 
 
+def clean_artist(value: str) -> str:
+    # Mutagen joins multi-value ID3 text frames with NUL, which PostgreSQL rejects.
+    return ' / '.join(part.strip() for part in value.split('\x00') if part.strip())[:120]
+
+
 def init_db():
 
     MUSIC.mkdir(parents=True, exist_ok=True)
@@ -73,6 +83,14 @@ def init_db():
     storage.init_storage(DB)
 
     with db() as con:
+
+        for track in con.execute('SELECT id,filename FROM tracks WHERE metadata_version=0').fetchall():
+            try:
+                tags = MP3(MUSIC / track['filename']).tags
+                artist = clean_artist(str(tags.get('TPE1', '') if tags else ''))
+            except Exception:
+                artist = ''
+            con.execute('UPDATE tracks SET artist=%s,metadata_version=1 WHERE id=%s', (artist, track['id']))
 
         for track in con.execute('SELECT id,filename FROM tracks WHERE content_hash IS NULL').fetchall():
 
@@ -120,7 +138,8 @@ app = FastAPI(title='Music Room', lifespan=lifespan, docs_url=None, redoc_url=No
 
 app.add_middleware(auth.AuthMiddleware)
 
-app.mount('/static', StaticFiles(directory=FRONTEND), name='static')
+app.mount('/static', StaticFiles(directory=FRONTEND / 'static', check_dir=False), name='static')
+app.mount('/_next', StaticFiles(directory=FRONTEND / '_next', check_dir=False), name='next-assets')
 
 
 
@@ -140,7 +159,7 @@ def require_admin(value: str | None):
 
 def track_dict(r):
 
-    return {'id': r['id'], 'title': r['title'], 'uploader': r['uploader'], 'duration': r['duration'], 'url': '/api/tracks/' + r['id'] + '/audio'}
+    return {'id': r['id'], 'title': r['title'], 'uploader': r['uploader'], 'artist': r.get('artist', ''), 'duration': r['duration'], 'url': '/api/tracks/' + r['id'] + '/audio'}
 
 
 
@@ -186,7 +205,7 @@ def snapshot():
 
         rows = con.execute('SELECT tracks.* FROM queue JOIN tracks ON queue.track_id=tracks.id ORDER BY queue.position').fetchall()
 
-        library_count = con.execute('SELECT count(*) AS total FROM tracks').fetchone()['total']
+        library_count = con.execute('SELECT last_value FROM catalog_revision').fetchone()['last_value']
 
         latest = con.execute('SELECT id,ended_at FROM play_history ORDER BY id DESC LIMIT 1').fetchone()
 
@@ -195,6 +214,8 @@ def snapshot():
         play_id = play['id'] if play else None
 
         reactions = reaction_counts(con, play_id)
+
+        site_copy = con.execute('SELECT copy FROM site_copy WHERE id=1').fetchone()['copy']
 
     position = float(state['playback_offset'])
 
@@ -207,6 +228,7 @@ def snapshot():
             'position': position, 'playing': bool(state['playing']), 'shuffle': bool(state['shuffle']),
 
             'play_id': play_id, 'reactions': reactions,
+            'site_copy': {**storage.DEFAULT_SITE_COPY, **site_copy},
 
             'library_revision': library_count, 'history_revision': f"{latest['id']}:{latest['ended_at']}" if latest else '0',
 
@@ -315,7 +337,7 @@ def admin_music_page(request: Request):
     user = auth.current_user(request)
     if not user or not user.get('is_admin'):
         raise HTTPException(403, 'دسترسی مدیر لازم است.')
-    return FileResponse(FRONTEND / 'admin-music.html', headers={'Cache-Control': 'no-store'})
+    return FileResponse(FRONTEND / 'admin' / 'music.html', headers={'Cache-Control': 'no-store'})
 
 
 @app.get('/api/state')
@@ -334,6 +356,21 @@ def login_page():
 
 
 
+@app.get('/manifest.webmanifest')
+def web_manifest():
+    return FileResponse(FRONTEND / 'manifest.webmanifest', media_type='application/manifest+json')
+
+
+@app.get('/sw.js')
+def service_worker():
+    return FileResponse(FRONTEND / 'sw.js', media_type='application/javascript', headers={'Cache-Control': 'no-cache'})
+
+
+@app.get('/offline.html')
+def offline_page():
+    return FileResponse(FRONTEND / 'offline.html', headers={'Cache-Control': 'no-cache'})
+
+
 @app.post('/api/auth/login')
 
 def user_login(payload: dict, request: Request, response: Response):
@@ -341,8 +378,6 @@ def user_login(payload: dict, request: Request, response: Response):
     try:
 
         token, user = auth.login(payload.get('name'), payload.get('password'),
-
-                                 request.client.host if request.client else 'unknown',
 
                                  request.cookies.get(auth.SESSION_COOKIE, ''))
 
@@ -534,22 +569,143 @@ async def react(payload: dict, request: Request):
 
 @app.get('/api/library')
 
-def library(q: str = '', limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0)):
-
-    term = '%' + q.strip().replace('\\\\', '\\\\\\\\').replace('%', '\\\\%').replace('_', '\\\\_') + '%'
-
+def library(q: str = '', limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0),
+            uploader: str = '', artist: str | None = None):
+    term = '%' + q.strip().replace('!', '!!').replace('%', '!%').replace('_', '!_') + '%'
+    where = "WHERE (title ILIKE %s ESCAPE '!' OR uploader ILIKE %s ESCAPE '!' OR artist ILIKE %s ESCAPE '!')"
+    params = [term, term, term]
+    if uploader:
+        where += ' AND uploader=%s'
+        params.append(uploader)
+    if artist is not None:
+        where += ' AND artist=%s'
+        params.append(artist)
     with db() as con:
-
-        where = "WHERE title ILIKE %s ESCAPE '\\\\' OR uploader ILIKE %s ESCAPE '\\\\'"
-
-        total = con.execute('SELECT count(*) AS total FROM tracks ' + where, (term, term)).fetchone()['total']
-
+        total = con.execute('SELECT count(*) AS total FROM tracks ' + where, params).fetchone()['total']
         rows = con.execute('SELECT * FROM tracks ' + where + ' ORDER BY created DESC,id DESC LIMIT %s OFFSET %s',
-
-                           (term, term, limit, offset)).fetchall()
-
+                           (*params, limit, offset)).fetchall()
     return {'items': [{**track_dict(r), 'uploaded_at': r['created']} for r in rows], 'total': total}
 
+
+@app.get('/api/library/categories')
+def library_categories():
+    with db() as con:
+        uploaders = con.execute('SELECT uploader AS name, count(*) AS count FROM tracks GROUP BY uploader ORDER BY uploader').fetchall()
+        artists = con.execute('SELECT artist AS name, count(*) AS count FROM tracks GROUP BY artist ORDER BY artist').fetchall()
+    return {'uploaders': uploaders, 'artists': artists}
+
+
+def playlist_name(payload):
+    name = payload.get('name')
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 100:
+        raise HTTPException(400, 'نام پلی‌لیست باید بین ۱ تا ۱۰۰ کاراکتر باشد.')
+    return name.strip()
+
+
+def owned_playlist(con, ident, request):
+    row = con.execute('SELECT * FROM playlists WHERE id=%s AND owner_id=%s FOR UPDATE',
+                      (ident, auth.current_user(request)['id'])).fetchone()
+    if not row:
+        raise HTTPException(404, 'پلی‌لیست پیدا نشد.')
+    return row
+
+
+@app.get('/api/playlists')
+def playlists(request: Request):
+    with db() as con:
+        rows = con.execute('''SELECT p.id,p.name,count(t.track_id) AS count FROM playlists p
+            LEFT JOIN playlist_tracks t ON t.playlist_id=p.id WHERE p.owner_id=%s
+            GROUP BY p.id ORDER BY p.id DESC''', (auth.current_user(request)['id'],)).fetchall()
+    return {'items': rows}
+
+
+@app.post('/api/playlists')
+def create_playlist(payload: dict, request: Request):
+    name = playlist_name(payload)
+    with db() as con:
+        row = con.execute('INSERT INTO playlists(owner_id,name) VALUES (%s,%s) RETURNING id,name',
+                          (auth.current_user(request)['id'], name)).fetchone()
+    return {**row, 'count': 0}
+
+
+@app.patch('/api/playlists/{ident}')
+def rename_playlist(ident: int, payload: dict, request: Request):
+    name = playlist_name(payload)
+    with db() as con:
+        owned_playlist(con, ident, request)
+        con.execute('UPDATE playlists SET name=%s WHERE id=%s', (name, ident))
+    return {'ok': True}
+
+
+@app.delete('/api/playlists/{ident}')
+def delete_playlist(ident: int, request: Request):
+    with db() as con:
+        owned_playlist(con, ident, request)
+        con.execute('DELETE FROM playlists WHERE id=%s', (ident,))
+    return {'ok': True}
+
+
+@app.get('/api/playlists/{ident}/tracks')
+def playlist_contents(ident: int, request: Request, limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0)):
+    with db() as con:
+        owned_playlist(con, ident, request)
+        total = con.execute('SELECT count(*) AS total FROM playlist_tracks WHERE playlist_id=%s', (ident,)).fetchone()['total']
+        rows = con.execute('''SELECT t.* FROM playlist_tracks p JOIN tracks t ON t.id=p.track_id
+            WHERE p.playlist_id=%s ORDER BY p.position LIMIT %s OFFSET %s''', (ident, limit, offset)).fetchall()
+    return {'items': [track_dict(r) for r in rows], 'total': total}
+
+
+@app.post('/api/playlists/{ident}/tracks/{track_id}')
+def add_playlist_track(ident: int, track_id: str, request: Request):
+    with db() as con:
+        owned_playlist(con, ident, request)
+        if not con.execute('SELECT id FROM tracks WHERE id=%s FOR KEY SHARE', (track_id,)).fetchone():
+            raise HTTPException(404, 'آهنگ پیدا نشد.')
+        con.execute('INSERT INTO playlist_tracks(playlist_id,track_id) VALUES (%s,%s) ON CONFLICT DO NOTHING', (ident, track_id))
+    return {'ok': True}
+
+
+@app.delete('/api/playlists/{ident}/tracks/{track_id}')
+def remove_playlist_track(ident: int, track_id: str, request: Request):
+    with db() as con:
+        owned_playlist(con, ident, request)
+        con.execute('DELETE FROM playlist_tracks WHERE playlist_id=%s AND track_id=%s', (ident, track_id))
+    return {'ok': True}
+
+
+@app.post('/api/playlists/{ident}/enqueue')
+async def enqueue_playlist(ident: int, request: Request):
+    added = skipped = 0
+    async with STATE_LOCK:
+        with db() as con:
+            con.execute('SELECT id FROM state WHERE id=1 FOR UPDATE')
+            owned_playlist(con, ident, request)
+            rows = con.execute('SELECT track_id FROM playlist_tracks WHERE playlist_id=%s ORDER BY position', (ident,)).fetchall()
+            for row in rows:
+                try:
+                    enqueue_track(con, row['track_id'])
+                    added += 1
+                except HTTPException as error:
+                    if error.status_code not in (404, 409):
+                        raise
+                    skipped += 1
+        await broadcast()
+    return {'added': added, 'skipped': skipped}
+
+
+@app.patch('/api/admin/tracks/{track_id}')
+async def update_track_artist(track_id: str, payload: dict, request: Request, x_admin_token: str | None = Header(default=None)):
+    require_chat_admin(request, x_admin_token)
+    artist = payload.get('artist')
+    if not isinstance(artist, str) or len(artist.strip()) > 120:
+        raise HTTPException(400, 'نام خواننده حداکثر ۱۲۰ کاراکتر است.')
+    async with STATE_LOCK:
+        with db() as con:
+            row = con.execute('UPDATE tracks SET artist=%s,metadata_version=1 WHERE id=%s RETURNING id', (clean_artist(artist), track_id)).fetchone()
+            if not row:
+                raise HTTPException(404, 'آهنگ پیدا نشد.')
+        await broadcast()
+    return {'ok': True}
 
 
 @app.get('/api/history')
@@ -618,7 +774,7 @@ async def enqueue(ident: str):
 
 @app.post('/api/upload')
 
-async def upload(request: Request, file: UploadFile = File(...)):
+async def upload(request: Request, file: UploadFile = File(...), artist: Annotated[str, Form(max_length=120)] = ''):
 
     uploader = auth.current_user(request)['name']
 
@@ -654,7 +810,9 @@ async def upload(request: Request, file: UploadFile = File(...)):
 
             raise HTTPException(400, 'Empty file')
 
-        duration = float(MP3(path).info.length)
+        metadata = MP3(path)
+        duration = float(metadata.info.length)
+        artist = clean_artist(artist) or clean_artist(str(metadata.tags.get('TPE1', '') if metadata.tags else ''))
 
         if not 0 < duration < 24 * 3600:
 
@@ -702,9 +860,9 @@ async def upload(request: Request, file: UploadFile = File(...)):
 
                 else:
 
-                    con.execute('INSERT INTO tracks(id,title,uploader,duration,filename,created,content_hash) VALUES (%s,%s,%s,%s,%s,%s,%s)',
+                    con.execute('INSERT INTO tracks(id,title,uploader,duration,filename,created,content_hash,artist,metadata_version) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1)',
 
-                                (ident, title, uploader, duration, filename, time.time(), content_hash))
+                                (ident, title, uploader, duration, filename, time.time(), content_hash, artist))
 
                 enqueue_track(con, ident)
 
@@ -753,13 +911,15 @@ def require_chat_admin(request, token):
 @app.get('/api/admin/tracks')
 def admin_tracks(
     request: Request,
+    uploader: str = '',
+    artist: str | None = None,
     q: str = '',
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     x_admin_token: str | None = Header(default=None),
 ):
     require_chat_admin(request, x_admin_token)
-    return library(q=q, limit=limit, offset=offset)
+    return library(q=q, limit=limit, offset=offset, uploader=uploader, artist=artist)
 
 
 @app.delete('/api/admin/tracks/{track_id}')
@@ -909,6 +1069,17 @@ def add_user(payload: dict, x_admin_token: str | None = Header(default=None)):
     return {'user': auth.create_user(payload.get('name'), payload.get('password'))}
 
 
+@app.patch('/api/admin/users/{user_id}')
+def edit_user(user_id: int, payload: dict, x_admin_token: str | None = Header(default=None)):
+    require_admin(x_admin_token)
+    if not isinstance(payload, dict) or 'name' not in payload:
+        raise HTTPException(400, 'نام کاربری را وارد کنید.')
+    password = payload.get('password')
+    if password == '':
+        password = None
+    return {'user': auth.update_user(user_id, payload.get('name'), password)}
+
+
 
 
 
@@ -955,6 +1126,54 @@ async def login(payload: dict, request: Request):
         raise HTTPException(403, 'Wrong password')
 
     return {'token': ADMIN_TOKEN}
+
+
+@app.put('/api/admin/site-copy')
+async def update_site_copy(payload: dict, request: Request, x_admin_token: str | None = Header(default=None)):
+    if not auth.current_user(request).get('is_admin'):
+        raise HTTPException(403, 'دسترسی مدیر لازم است.')
+    require_admin(x_admin_token)
+    limits = {'hero_title': 100, 'hero_cover': 700000, 'hero_text_color': 7, 'hero_accent_color': 7}
+    if not payload or any(key not in limits for key in payload):
+        raise HTTPException(400, 'فیلد متن نامعتبر است.')
+    updates = {}
+    for key, value in payload.items():
+        if not isinstance(value, str):
+            raise HTTPException(400, 'متن باید رشته باشد.')
+        value = value.strip()
+        if key == 'hero_cover':
+            if value:
+                match = re.fullmatch(r'data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)', value)
+                if not match or len(value) > limits[key]:
+                    raise HTTPException(400, 'کاور باید عکس PNG، JPEG یا WebP با حجم حداکثر ۵۰۰ کیلوبایت باشد.')
+                try:
+                    image = base64.b64decode(match[2], validate=True)
+                except (ValueError, binascii.Error):
+                    raise HTTPException(400, 'عکس معتبر نیست.')
+                signatures = {'png': image.startswith(b'\x89PNG\r\n\x1a\n'),
+                              'jpeg': image.startswith(b'\xff\xd8\xff'),
+                              'webp': image.startswith(b'RIFF') and image[8:12] == b'WEBP'}
+                if len(image) > 500 * 1024 or not signatures[match[1]]:
+                    raise HTTPException(400, 'عکس معتبر نیست یا حجم آن بیش از حد مجاز است.')
+            updates[key] = value
+            continue
+        if key in ('hero_text_color', 'hero_accent_color'):
+            if not re.fullmatch(r'#[0-9a-fA-F]{6}', value):
+                raise HTTPException(400, 'رنگ معتبر نیست.')
+            updates[key] = value
+            continue
+        if (not value or len(value) > limits[key] or
+                any(ord(char) < 32 and char != '\n' for char in value) or
+                value.count('\n') > 2):
+            raise HTTPException(400, 'متن واردشده معتبر نیست یا بیش از حد طولانی است.')
+        updates[key] = value
+    async with STATE_LOCK:
+        with db() as con:
+            current = con.execute('SELECT copy FROM site_copy WHERE id=1 FOR UPDATE').fetchone()['copy']
+            result = {**storage.DEFAULT_SITE_COPY, **current, **updates}
+            con.execute('UPDATE site_copy SET copy=%s WHERE id=1', (Jsonb(result),))
+        await broadcast()
+    return {'site_copy': result}
 
 
 
